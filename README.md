@@ -1,6 +1,6 @@
-# HiJax
+# hijax
 
-Experiment Framework for Jax and Haiku.
+Experiment framework for Haiku.
 
 ## Requirements
 
@@ -19,7 +19,7 @@ TODO
 
 ## Experiment Framework
 
-Experiments in HiJax are organised around three core concepts:
+Experiments in hijax are organised around three core concepts:
 
 ### Models
 
