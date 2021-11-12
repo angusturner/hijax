@@ -1,5 +1,8 @@
 # hijax
 
+### WARNING - UNDER CONSTRUCTION
+### This repo could change drastically in the near future!
+
 High level abstractions for Jax. Specifically, hijax provides:
 - CLI for initialising new machine-learning projects
 - A framework for training neural nets using Jax and Haiku
