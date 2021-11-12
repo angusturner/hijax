@@ -1,6 +1,12 @@
 # hijax
 
-Experiment framework for Haiku.
+High level abstractions for Jax. Specifically, hijax provides:
+- CLI for initialising new machine-learning projects
+- A framework for training neural nets using Jax and Haiku
+- Dataset management
+- State management (i.e checkpoint saving)
+- Plotting to Weights and Biases
+- Other modules and utilities?
 
 ## Requirements
 
@@ -15,7 +21,13 @@ TODO
 
 ## QuickStart
 
-TODO
+hijax enforces a particular directory layout, and as such provides scripts for initialising
+a new project or for converting an existing one.
+
+`TODO`
+### Existing Project
+
+### New Project
 
 ## Experiment Framework
 
@@ -25,7 +37,7 @@ Experiments in hijax are organised around three core concepts:
 
 - A Haiku module object (inherits from `hk.Module`)
 - Should not contain optimisation related code.
-- Must be included `models/__init__.py` to be dynamically loaded by the experiment runner.
+- Must be included `models/__init__.py` to be dynamically loaded by the worker.
 
 ### Workers
 
@@ -41,7 +53,6 @@ Experiments in hijax are organised around three core concepts:
 - Must implement `__len__` and `__getitem__`
 - Will be wrapped with the PyTorch `DataLoader` class for batching and collation
 - Must be included in `datasets/__init__.py` to be dynamically loaded by the experiment runner.
-- Refer to `datasets/binary_mnist.py` for an example.
 
 Note that there is not a strict 1:1 relationship between workers and models, models and datasets etc.
 It is up to the developer to ensure a compatible API between these various components.
