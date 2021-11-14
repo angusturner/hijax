@@ -2,11 +2,9 @@ import os
 import wandb
 
 from omegaconf import DictConfig
-from typing import Optional, Union
+from typing import Optional, Union, Callable, Any
 
-import torch
-import haiku as hk
-
+from hijax import AbstractWorker
 from hijax.setup.setup_config import setup_config
 from hijax.setup.utils import import_pkg
 
@@ -20,7 +18,7 @@ def setup_worker(
     overwrite: bool = False,
     reset_metrics: bool = False,
     checkpoint_id: str = "best",
-):
+) -> (AbstractWorker, DictConfig):
     """
     Create or load an experiment.
     :param name: unique experiment name for saving/resuming
@@ -50,27 +48,29 @@ def setup_worker(
     # setup the directory
     cfg = setup_config(name, cfg, exp_dir, overwrite)
 
-    # initialise model
-    model_class = getattr(models, cfg["model"].pop("class"))
-    model: Union[torch.nn.Module, hk.Module] = model_class(**cfg["model"])
+    # setup the model
+    model_constructor: Callable[..., Any] = getattr(models, cfg["model"].pop("__constructor__"))
+    model: Any = model_constructor(**cfg["model"])
 
     # setup visualisation
     run = None
     if include_wandb and "wandb" in cfg:
         cfg_ = cfg
         if type(cfg) == DictConfig:
-            cfg_ = cfg.to_dict()
+            cfg_ = dict(cfg)
         run = wandb.init(name=name, config=cfg_, id=cfg["run_id"], resume="allow", **cfg["wandb"])
-
-        # if using PyTorch, WandB can track the gradients automatically like this...
-        if type(model) == torch.nn.Module:
-            run.watch(model)
 
     # initialise the worker
     run_dir = "{}/{}".format(exp_dir, name)
-    worker_class = getattr(workers, cfg["worker"].pop("class"))
-    worker = worker_class(
-        name, model, run_dir, run, checkpoint_id=checkpoint_id, reset_metrics=reset_metrics, **cfg["worker"]
+    worker_class: Callable[..., AbstractWorker] = getattr(workers, cfg["worker"].pop("__constructor__"))
+    worker: AbstractWorker = worker_class(
+        model=model,
+        checkpoint_id=checkpoint_id,
+        exp_name=name,
+        run_dir=run_dir,
+        wandb=run,
+        reset_metrics=reset_metrics,
+        **cfg["worker"],
     )
 
     return worker, cfg

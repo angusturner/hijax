@@ -1,5 +1,7 @@
+from functools import partial
+
 import numpy as np
-from typing import Tuple
+from typing import Tuple, Callable
 
 from torch.utils.data import DataLoader, Dataset
 from hijax.setup.utils import import_pkg
@@ -16,10 +18,9 @@ def worker_init_fn(worker_id):
     np.random.seed(np.random.get_state()[1][0] + worker_id)
 
 
-def setup_loaders(dataset_class: str, data_opts: dict, loader_opts: dict, module: str) -> Tuple[DataLoader, DataLoader]:
+def setup_loaders(data_opts: dict, loader_opts: dict, module: str) -> Tuple[DataLoader, DataLoader]:
     """
     Create PyTorch data loaders for training and validation.
-    :param dataset_class: name of dataset class. any class exported in <module>/data/__init__.py
     :param data_opts: `dataset` config sub-dictionary
     :param loader_opts: `loader` config sub-dictionary
     :param module: string name of the module to import `datasets` from
@@ -34,9 +35,12 @@ def setup_loaders(dataset_class: str, data_opts: dict, loader_opts: dict, module
     test = data_opts.get("test", {})
 
     # initialise datasets
-    dataset_class = getattr(datasets, dataset_class)
-    train_dataset: Dataset = dataset_class(**{**both, **train})
-    test_dataset: Dataset = dataset_class(**{**both, **test})
+    constructor_name: str = data_opts.pop("__constructor__", None)
+    if constructor_name is None:
+        raise ValueError("`data_opts` must specify a valid `__constructor__` key.")
+    dataset_constructor: Callable[..., Dataset] = getattr(datasets, constructor_name)
+    train_dataset: Dataset = dataset_constructor(**{**both, **train})
+    test_dataset: Dataset = dataset_constructor(**{**both, **test})
 
     # loader settings
     both = loader_opts.get("both", {})
@@ -63,11 +67,8 @@ def setup_loaders(dataset_class: str, data_opts: dict, loader_opts: dict, module
             opts.pop("drop_last", None)
 
     # initialise loaders
-    train_loader = DataLoader(
-        dataset=train_dataset, collate_fn=collate_fn, worker_init_fn=worker_init_fn, **train_loader_opts
-    )
-    test_loader = DataLoader(
-        dataset=test_dataset, collate_fn=collate_fn, worker_init_fn=worker_init_fn, **test_loader_opts
-    )
+    DataLoader_ = partial(DataLoader, collate_fn=collate_fn, worker_init_fn=worker_init_fn)
+    train_loader = DataLoader_(dataset=train_dataset, **train_loader_opts)
+    test_loader = DataLoader_(dataset=test_dataset, **test_loader_opts)
 
     return train_loader, test_loader
