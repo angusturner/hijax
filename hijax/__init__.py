@@ -1,2 +1,2 @@
 from .worker import Worker
-from .setup import Loaders
+from .loaders import Loaders

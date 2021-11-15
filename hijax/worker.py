@@ -9,7 +9,7 @@ from wandb.wandb_run import Run
 
 from torch.utils.data import DataLoader
 
-from hijax import Loaders
+from hijax.loaders import Loaders
 from hijax.utils import recursive_set
 
 

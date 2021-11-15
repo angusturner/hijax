@@ -1,19 +1,12 @@
 from functools import partial
 
 import numpy as np
-from typing import Tuple, Callable, NamedTuple
+from typing import Callable
 
 from torch.utils.data import DataLoader, Dataset
+
+from hijax.loaders import Loaders
 from hijax.setup.utils import import_pkg
-
-
-class Loaders(NamedTuple):
-    """
-    Container for the data loaders
-    """
-
-    train: DataLoader
-    test: DataLoader
 
 
 def worker_init_fn(worker_id):

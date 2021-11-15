@@ -7,7 +7,8 @@ from omegaconf import DictConfig
 from typing import Optional, Union, Callable, Any
 
 from hijax import Worker
-from hijax.setup import Loaders, setup_loaders
+from hijax.setup import setup_loaders
+from hijax.loaders import Loaders
 from hijax.setup.setup_config import setup_config
 from hijax.setup.utils import import_pkg
 
