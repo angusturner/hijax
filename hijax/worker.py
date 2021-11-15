@@ -1,24 +1,29 @@
 import torch
-import torch.nn as nn
 import os
 import numpy as np
 from abc import ABC, abstractmethod
-from typing import Any, Optional
+from typing import Optional, List, Dict, Any
 from pathlib import Path
 
 from wandb.wandb_run import Run
 
 from torch.utils.data import DataLoader
 
+from hijax import Loaders
+from hijax.utils import recursive_set
 
-class AbstractWorker(ABC):
+
+class Worker(ABC):
     def __init__(
         self,
         exp_name: str,
         run_dir: str,
+        loaders: Optional[Loaders] = None,
         wandb: Optional[Run] = None,
         epoch_save_freq: int = 50,
         log_interval: int = 50,
+        reset_metrics: bool = False,
+        upload_checkpoints: bool = False,
         *_args,
         **kwargs,
     ):
@@ -26,27 +31,31 @@ class AbstractWorker(ABC):
         All workers should inherit from this class. It will:
         1. provide common utilities for saving, loading and device management.
         2. enforce a common interface between workers. i.e) must implement `.train()` and `evaluate.()`
-        3. provide a common interface for logging to WandB.
+        3. provide utilities for logging to WandB.
 
         :param exp_name: name of experiment
         :param run_dir: directory to save configurations, weights, artifacts for this experiment.
         :param wandb: the session that is returned from wandb.init(...).
+        :param loaders: a Loaders object that contains the train and test sets.
         :param epoch_save_freq: how often to save intermediate checkpoints
         :param log_interval: how many gradient updates before logging to wandb
+        :param reset_metrics: whether to discard metrics saved with the existing checkpoint.
+            (i.e. for fine-tuning)
+        :param upload_checkpoints: whether to upload checkpoints to wandb.
         :param args:
         :param kwargs:
         """
 
-        self.reset_metrics = kwargs.get("reset_metrics", False)
         self.exp_name = exp_name
         self.wandb = wandb
+        self.loaders = loaders
         self.run_dir = run_dir
-        self.upload_checkpoints = kwargs.get("upload_checkpoints", False)
+        self.reset_metrics = reset_metrics
+        self.upload_checkpoints = upload_checkpoints
 
-        # keep a list of all stateful objects, to include in the experiment checkpoints
-        # includes the model by default
+        # keep a record of all stateful objects, to include in the experiment checkpoints
         # see: `register_state()
-        self.stateful_objects = {}
+        self.state_dict = {}
 
         # track loss and summary stats
         self.lowest_loss = float("inf")
@@ -62,31 +71,28 @@ class AbstractWorker(ABC):
         self._metric_cache = {"train": {}, "test": {}}
 
     @abstractmethod
-    def train(self, loader):
+    def train(self, loader: Optional[DataLoader] = None) -> Any:
         pass
 
     @abstractmethod
-    def evaluate(self, loader):
+    def evaluate(self, loader: Optional[DataLoader] = None) -> (float, Dict):
         pass
 
-    def run(self, train_loader: DataLoader, test_loader: DataLoader, nb_epoch: int):
+    def run(self, nb_epoch: int):
         """
         Run an experiment for the specified number of epoch.
-        :param train_loader:
-        :param test_loader:
         :param nb_epoch:
         :return:
         """
+        assert self.loaders is not None, "No loaders initialised! Ensure `with_loaders=True` in call to setup_worker()"
         for epoch in range(nb_epoch):
             # reset numpy random seed
-            # TODO: check how we are handling random state for Haiku
             np.random.seed(0)
 
-            # train and test sets
-            self.train(train_loader)
+            # train one epoch and evaluate
+            self.train()
             self.epoch_counter += 1
-            with torch.no_grad():
-                loss_score, summary_stats = self.evaluate(test_loader)
+            loss_score, summary_stats = self.evaluate()
 
             # track individual metrics at an epoch level
             assert type(summary_stats) == dict, "`worker.evaluate()` expects return type : (float, Dict)"
@@ -110,93 +116,73 @@ class AbstractWorker(ABC):
             # overwrite latest weights
             self.save(checkpoint_id="latest")
 
-    def cuda(self, device_id: int = 0):
+    def register_state(self, obj: dict, name: str):
         """
-        Move the model and all optimisers to the GPU.
-        :return:
-        """
-        assert torch.cuda.is_available(), "CUDA support not found!"
-        for key, obj in self.stateful_objects.items():
-            if isinstance(obj, AbstractWorker):
-                continue
-            if hasattr(obj, "cuda"):
-                self.stateful_objects[key].cuda(device_id)
-
-    def register_state(self, obj: Any, name: str):
-        """
-        Register an object to be included in the experiment checkpoint.
-        Any object implementing `.load_state_dict()` and `.state_dict()` is valid. For example:
-            - PyTorch optimiser, LR Scheduler or Model
-            - Any custom class implementing those methods (e.g. a specific worker with extra state)
-
-        :param obj: obj
+        Register an object to be included in the experiment checkpoint. Any pickle-able dictionary is valid.
+        :param obj: any dictionary
         :param name: unique name for what is being registered
         """
-        assert name not in self.stateful_objects, "Duplicate key in state list for '{}'".format(name)
-        assert hasattr(obj, "load_state_dict"), "Object must implement `load_state_dict` to be included in checkpoint."
-        assert hasattr(obj, "state_dict"), "Object must implement `state_dict` to be included in checkpoint."
-
-        self.stateful_objects[name] = obj
+        assert name not in self.state_dict, "Duplicate key in state list for '{}'".format(name)
+        self.state_dict[name] = obj
 
     def save(self, checkpoint_id: str = "latest"):
         """
-        Save state of all tracked modules.
+        Save state of all registered objects to a checkpoint.
         :param checkpoint_id:
         :return:
         """
+        # track additional top-level state, related to the evaluation metrics and nb. of completed epochs
         state_dict = {
             "lowest_loss": self.lowest_loss,
             "summary_stats": self.summary_stats,
             "epoch_counter": self.epoch_counter,
         }
-        for key, obj in self.stateful_objects.items():
-            state_dict[key] = obj.state_dict()
+        for key, val in self.state_dict.items():
+            state_dict[key] = val
 
-        checkpoint_path = "{}/checkpoint_{}.pt".format(self.run_dir, checkpoint_id)
+        # save checkpoint
+        checkpoint_path = os.path.join(self.run_dir, f"checkpoint_{checkpoint_id}.pt")
         print("Saving checkpoint {}".format(checkpoint_path))
         torch.save(state_dict, checkpoint_path)
 
         # upload and overwrite the checkpoints to wandb if `upload_checkpoints` enabled in worker config
-        if self.wandb is not None and self.upload_checkpoints and checkpoint_id in ["latest", "best"]:
+        if self.wandb is not None and self.upload_checkpoints and checkpoint_id in {"latest", "best"}:
             self.wandb.save(glob_str=checkpoint_path, base_path=str(Path(self.run_dir).parent), policy="live")
 
-    def load(self, checkpoint_id: str = "best", strict: bool = True, with_optim: bool = True):
+    def load(self, checkpoint_id: str = "best", skip_keys: Optional[List[str]] = None):
         """
         Load state from existing checkpoint.
         :param checkpoint_id:
-        :param strict: whether to use strict loading for the model weights (see PyTorch nn.Module `load_state_dict)
-        :param with_optim:
+        :param skip_keys: skip loading the state of these keys. For example, we may want to discard certain bits of
+            state (e.g. the optimiser state) for fine-tuning.
         :return:
         """
-
-        checkpoint_path = "{}/checkpoint_{}.pt".format(self.run_dir, checkpoint_id)
+        skip_keys = set(skip_keys or [])
+        checkpoint_path = os.path.join(self.run_dir, f"checkpoint_{checkpoint_id}.pt")
 
         if not os.path.exists(checkpoint_path):
             print("Checkpoint not found {}".format(checkpoint_path))
             return
 
-        print("Loading checkpoint {}".format(checkpoint_path))
-
         state_dict = torch.load(checkpoint_path)
-        for key, state in state_dict.items():
-            # skip optimiser
-            if not with_optim and key == "optim":
+        for key, src in state_dict.items():
+            if key in skip_keys:
+                print(f"Skipping loading of {key}")
                 continue
-            # skip over important top-level state (always track this!)
+            # skip over important top-level state (handled separately, below)
             if key in {"lowest_loss", "summary_stats", "epoch_counter"}:
                 continue
-            # handle remaining objects (model, worker, optimiser, any other user defined stuff)
-            if key not in self.stateful_objects:
+            # handle key mismatches
+            if key not in self.state_dict:
                 print(
                     f"Warning! {key} was found in the checkpoint but not in the stateful objects for the current"
                     f"run!"
                 )
-            else:
-                obj = self.stateful_objects[key]
-                if isinstance(obj, nn.Module):
-                    obj.load_state_dict(state, strict)
-                else:
-                    obj.load_state_dict(state)
+                continue
+
+            # copy the leaf-values of the loaded dict structure into the state dict
+            sink = self.state_dict[key]
+            recursive_set(src, sink)
 
         if not self.reset_metrics:
             self.summary_stats = state_dict.get("summary_stats", {})
@@ -227,7 +213,7 @@ class AbstractWorker(ABC):
             full_key = "{} {}".format(k, subset)
             if full_key not in self._metric_cache[subset]:
                 self._metric_cache[subset][full_key] = []
-            v_raw = AbstractWorker.unwrap_value(v)
+            v_raw = Worker.unwrap_value(v)
             self._metric_cache[subset][full_key].append(v_raw)
 
         # increment the counter

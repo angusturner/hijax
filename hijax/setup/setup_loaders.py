@@ -1,10 +1,19 @@
 from functools import partial
 
 import numpy as np
-from typing import Tuple, Callable
+from typing import Tuple, Callable, NamedTuple
 
 from torch.utils.data import DataLoader, Dataset
 from hijax.setup.utils import import_pkg
+
+
+class Loaders(NamedTuple):
+    """
+    Container for the data loaders
+    """
+
+    train: DataLoader
+    test: DataLoader
 
 
 def worker_init_fn(worker_id):
@@ -18,7 +27,7 @@ def worker_init_fn(worker_id):
     np.random.seed(np.random.get_state()[1][0] + worker_id)
 
 
-def setup_loaders(data_opts: dict, loader_opts: dict, module: str) -> Tuple[DataLoader, DataLoader]:
+def setup_loaders(data_opts: dict, loader_opts: dict, module: str) -> Loaders:
     """
     Create PyTorch data loaders for training and validation.
     :param data_opts: `dataset` config sub-dictionary
@@ -71,4 +80,4 @@ def setup_loaders(data_opts: dict, loader_opts: dict, module: str) -> Tuple[Data
     train_loader = DataLoader_(dataset=train_dataset, **train_loader_opts)
     test_loader = DataLoader_(dataset=test_dataset, **test_loader_opts)
 
-    return train_loader, test_loader
+    return Loaders(train_loader, test_loader)
