@@ -2,6 +2,7 @@ import torch
 import os
 import numpy as np
 from abc import ABC, abstractmethod
+from jaxlib.xla_extension import DeviceArray
 from typing import Optional, List, Dict, Any
 from pathlib import Path
 
@@ -189,11 +190,13 @@ class Worker(ABC):
             self.lowest_loss = state_dict.get("lowest_loss", float("inf"))
         self.epoch_counter = state_dict.get("epoch_counter", 0)
 
+        print(f"Loaded checkpoint {checkpoint_path}!")
+
     @staticmethod
     def unwrap_value(v):
         if torch.is_tensor(v):
             return v.item()
-        elif type(v) == np.ndarray:
+        elif type(v) in {np.ndarray, DeviceArray}:
             return v.item()
         else:
             return v
