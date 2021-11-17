@@ -1,9 +1,10 @@
 import torch
+import jax
 import os
 import numpy as np
 from abc import ABC, abstractmethod
 from jaxlib.xla_extension import DeviceArray
-from typing import Optional, List, Dict, Any
+from typing import Optional, Dict, Any
 from pathlib import Path
 
 from wandb.wandb_run import Run
@@ -11,7 +12,6 @@ from wandb.wandb_run import Run
 from torch.utils.data import DataLoader
 
 from hijax.loaders import Loaders
-from hijax.utils import recursive_set
 
 
 class Worker(ABC):
@@ -25,14 +25,16 @@ class Worker(ABC):
         log_interval: int = 50,
         reset_metrics: bool = False,
         upload_checkpoints: bool = False,
+        random_seed: int = 42,
         *_args,
         **kwargs,
     ):
         """
-        All workers should inherit from this class. It will:
-        1. provide common utilities for saving, loading and device management.
-        2. enforce a common interface between workers. i.e) must implement `.train()` and `evaluate.()`
-        3. provide utilities for logging to WandB.
+        All workers / model trainers should inherit from this class. It will:
+        1. Enforce a common interface between workers
+        2. Implement methods for saving and loading checkpoints.
+        3. Provide utilities for logging to WandB.
+        4. Handle Jax random keys
 
         :param exp_name: name of experiment
         :param run_dir: directory to save configurations, weights, artifacts for this experiment.
@@ -43,6 +45,7 @@ class Worker(ABC):
         :param reset_metrics: whether to discard metrics saved with the existing checkpoint.
             (i.e. for fine-tuning)
         :param upload_checkpoints: whether to upload checkpoints to wandb.
+        :param random_seed: the random seed to use for Jax
         :param args:
         :param kwargs:
         """
@@ -54,9 +57,8 @@ class Worker(ABC):
         self.reset_metrics = reset_metrics
         self.upload_checkpoints = upload_checkpoints
 
-        # keep a record of all stateful objects, to include in the experiment checkpoints
-        # see: `register_state()
-        self.state_dict = {}
+        # RNG key management
+        self.rng_key = jax.random.PRNGKey(random_seed)
 
         # track loss and summary stats
         self.lowest_loss = float("inf")
@@ -78,6 +80,21 @@ class Worker(ABC):
     @abstractmethod
     def evaluate(self, loader: Optional[DataLoader] = None) -> (float, Dict):
         pass
+
+    @abstractmethod
+    def get_state_dict(self) -> Dict:
+        return {}
+
+    @abstractmethod
+    def load_state_dict(self, state_dict: Dict):
+        pass
+
+    def next_rng_key(self):
+        """
+        Iterate the random key, and  return the sub-key
+        """
+        self.rng_key, sub_key = jax.random.split(self.rng_key)
+        return sub_key
 
     def run(self, nb_epoch: int):
         """
@@ -117,18 +134,9 @@ class Worker(ABC):
             # overwrite latest weights
             self.save(checkpoint_id="latest")
 
-    def register_state(self, obj: dict, name: str):
-        """
-        Register an object to be included in the experiment checkpoint. Any pickle-able dictionary is valid.
-        :param obj: any dictionary
-        :param name: unique name for what is being registered
-        """
-        assert name not in self.state_dict, "Duplicate key in state list for '{}'".format(name)
-        self.state_dict[name] = obj
-
     def save(self, checkpoint_id: str = "latest"):
         """
-        Save state of all registered objects to a checkpoint.
+        Save state to a checkpoint.
         :param checkpoint_id:
         :return:
         """
@@ -137,9 +145,9 @@ class Worker(ABC):
             "lowest_loss": self.lowest_loss,
             "summary_stats": self.summary_stats,
             "epoch_counter": self.epoch_counter,
+            "rng_key": self.rng_key,
+            **self.get_state_dict(),
         }
-        for key, val in self.state_dict.items():
-            state_dict[key] = val
 
         # save checkpoint
         checkpoint_path = os.path.join(self.run_dir, f"checkpoint_{checkpoint_id}.pt")
@@ -150,56 +158,43 @@ class Worker(ABC):
         if self.wandb is not None and self.upload_checkpoints and checkpoint_id in {"latest", "best"}:
             self.wandb.save(glob_str=checkpoint_path, base_path=str(Path(self.run_dir).parent), policy="live")
 
-    def load(self, checkpoint_id: str = "best", skip_keys: Optional[List[str]] = None):
+    def load(self, checkpoint_id: str = "best"):
         """
         Load state from existing checkpoint.
         :param checkpoint_id:
-        :param skip_keys: skip loading the state of these keys. For example, we may want to discard certain bits of
-            state (e.g. the optimiser state) for fine-tuning.
         :return:
         """
-        skip_keys = set(skip_keys or [])
         checkpoint_path = os.path.join(self.run_dir, f"checkpoint_{checkpoint_id}.pt")
-
         if not os.path.exists(checkpoint_path):
             print("Checkpoint not found {}".format(checkpoint_path))
             return
 
-        state_dict = torch.load(checkpoint_path)
-        for key, src in state_dict.items():
-            if key in skip_keys:
-                print(f"Skipping loading of {key}")
-                continue
-            # skip over important top-level state (handled separately, below)
-            if key in {"lowest_loss", "summary_stats", "epoch_counter"}:
-                continue
-            # handle key mismatches
-            if key not in self.state_dict:
-                print(
-                    f"Warning! {key} was found in the checkpoint but not in the stateful objects for the current"
-                    f"run!"
-                )
-                continue
+        state_dict: Dict = torch.load(checkpoint_path)
 
-            # copy the leaf-values of the loaded dict structure into the state dict
-            sink = self.state_dict[key]
-            recursive_set(src, sink)
-
+        # load top-level / abstract state
+        summary_stats = state_dict.pop("summary_stats", {})
+        lowest_loss = state_dict.pop("lowest_loss", float("inf"))
         if not self.reset_metrics:
-            self.summary_stats = state_dict.get("summary_stats", {})
-            self.lowest_loss = state_dict.get("lowest_loss", float("inf"))
-        self.epoch_counter = state_dict.get("epoch_counter", 0)
+            self.summary_stats = summary_stats
+            self.lowest_loss = lowest_loss
+        self.epoch_counter = state_dict.pop("epoch_counter", 0)
+        self.rng_key = state_dict.pop("rng_key", jax.random.PRNGKey(0))
+
+        # load concrete / user-defined state
+        self.load_state_dict(state_dict)
 
         print(f"Loaded checkpoint {checkpoint_path}!")
 
     @staticmethod
     def unwrap_value(v):
-        if torch.is_tensor(v):
+        """
+        Unwrap a scalar value from a tensor / np.array.
+        :param v:
+        :return:
+        """
+        if torch.is_tensor(v) or type(v) in {np.ndarray, DeviceArray}:
             return v.item()
-        elif type(v) in {np.ndarray, DeviceArray}:
-            return v.item()
-        else:
-            return v
+        return v
 
     def _plot_loss(self, metrics: dict, train=True):
         """
