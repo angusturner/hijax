@@ -1,67 +1,150 @@
 # hijax
 
-### WARNING - UNDER CONSTRUCTION
-### This repo could change drastically in the near future!
+An experiment framework for [jax](https://github.com/google/jax) and [haiku](https://github.com/deepmind).
+Provides an opinionated structure for running machine learning experiments, including
+the following features:
+- Config management using [Hydra](https://hydra.cc/docs/intro)
+- Model checkpointing and loading
+- Plotting to [Weights and Biases](wandb.ai/)
+- Data loading using the PyTorch `DataLoader`
 
-High level abstractions for Jax. Specifically, hijax provides:
-- CLI for initialising new machine-learning projects
-- A framework for training neural nets using Jax and Haiku
-- Dataset management
-- State management (i.e checkpoint saving)
-- Plotting to Weights and Biases
-- Other modules and utilities?
+## Example Project
+
+For a complete example, see https://github.com/angusturner/neural_chess
 
 ## Requirements
 
 - Python >= 3.8
-- Jax (install depending on your OS)
-- PyTorch CPU install (used for data loading)
-- (recommended) Linux
+- [Jax](https://github.com/google/jax). Note: this is not handled by hijax, since it depends 
+on your specific platform.
 
 ## Installation
 
-TODO
+Clone the repository, and then run `pip install hijax`.
 
-## QuickStart
+## Structure of a Hijax Project
 
-hijax enforces a particular directory layout, and as such provides scripts for initialising
-a new project or for converting an existing one.
+Hijax is opinionated about the structure of a project. While additional folders and files can be added, it is highly
+advised to at least have the following skeleton:
+```text
+<module name>
+├── config
+│   ├── dataset
+│       └── ...
+│   ├── loader
+│       └── ...
+│   ├── model
+│       └── ...
+│   ├── worker
+│       └── ...
+│   └── config.yaml
+├── <module name>
+│   ├── datasets
+│       └── __init__.py
+│       └── ...
+│   ├── models
+│       └── __init__.py
+│       └── ...
+│   └── workers
+│       └── __init__.py
+│       └── ...
+└── ...other scripts, notebooks, data etc.
+```
 
-`TODO`
-### Existing Project
+Where `<your module name>` is the name of your project (i.e. `neural_chess` in the example project).
 
-### New Project
-
-## Experiment Framework
+## Core Concepts
 
 Experiments in hijax are organised around three core concepts:
 
 ### Models
 
-- A Haiku module object (inherits from `hk.Module`)
-- Should not contain optimisation related code.
-- Must be included `models/__init__.py` to be dynamically loaded by the worker.
+The concept of a model in hijax is quite flexible. A model can be any python callable that maps a set of inputs to a set
+of outputs. For example, this could be some neural net code implemented in Jax or Haiku. 
+
+For each model we define, we also need to export a corresponding factory function in
+`model.__init__.py`. This function takes the model settings/hyper-parameters (passed down from the yaml config),
+and returns the initialised model as a python callable.
+
+Functions registered in the `__init__.py` can be referenced by name in the config, allowing
+us to dynamically load the appropriate model code for our experiment. See [`build_policy_net`](https://github.com/angusturner/neural_chess/blob/master/neural_chess/models/policy_net.py)
+for an example.
 
 ### Workers
 
-- Responsible for training and evaluating models
-- Must implement `.train` and `.evaluate`
-- Should inherit from the `AbstractWorker` class, which will:
-    1. provide utility methods for saving and loading experiment checkpoints.
-    2. enforce a common training interface
-- Must be included in `workers/__init__.py` to be dynamically loaded by the experiment runner.
+The `Worker` abstraction in hijax provides a common interface for running experiments, saving and loading 
+checkpoints and plotting to WandB. This is where optimisation code belongs, as well as any extra methods
+that are required to support model evaluation or inference.
+
+A worker must implement the following required methods:
+- `__init__`: takes the model and data loaders as arguments, along with any user-defined args/kwargs.
+- `train`: iterate over a training loader, and perform optimisation
+- `eval`: iterate over a validation loader, and return evaluation metrics
+- `get_state_dict()` : return a dictionary of the current state of the worker (e.g. model and optimiser state)
+- `load_state_dict(state_dict)` : load a state dict into the worker
+
+As with models, each worker should be exported in `worker.__init__.py` to allow it to be referenced
+in the config.
+
 
 ### Datasets
 
-- Must implement `__len__` and `__getitem__`
-- Will be wrapped with the PyTorch `DataLoader` class for batching and collation
-- Must be included in `datasets/__init__.py` to be dynamically loaded by the experiment runner.
+Datasets in hijax leverage the excellent PyTorch `DataLoader` class. A `Dataset` can therefore be any
+class that is compatible with the PyTorch `DataLoader`, meaning:
 
-Note that there is not a strict 1:1 relationship between workers and models, models and datasets etc.
-It is up to the developer to ensure a compatible API between these various components.
+- It must implement the `__len__` method, which returns the number of samples in the dataset.
+- It must implement the `__getitem__` method, which returns a single sample from the dataset.
 
-### Examples
+Once again, we must declare each dataset in `datasets.__init__.py` to allow it to be referenced in the config.
+
+### Coupling between each component
+
+There is not a strict 1:1 relationship between workers and models, models, datasets. It is up to the 
+developer to ensure a compatible API between these various components. For example, a supervised image 
+classification task may require a single worker with generic optimisation logic, that can support
+many datasets and models.
+
+## Configuring an Experiment
 
 TODO
 
 For more information on how Hydra works refer to the [Hydra docs](https://hydra.cc/docs/intro).
+
+## Tying it all Together
+
+
+### A simple training script
+
+```python
+import hydra
+from omegaconf import DictConfig
+from hijax.setup import setup_worker
+
+
+@hydra.main(config_path="config", config_name="config")
+def train(cfg: DictConfig) -> None:
+    # get the experiment name
+    name = cfg.get("name", False)
+    if not name:
+        raise Exception("Must specify experiment name on CLI. e.g. `python train.py name=vae ...`")
+
+    # setup the worker
+    overwrite = cfg.get("overwrite", False)
+    reset_metrics = cfg.get("reset_metrics", False)
+    worker, cfg = setup_worker(
+        name=name,
+        cfg=cfg,
+        overwrite=overwrite,
+        reset_metrics=reset_metrics,
+        module="neural_chess",  # the module containing the model, worker and datasets
+        with_wandb=True,
+        with_loaders=True,
+    )
+
+    # train
+    worker.run(nb_epoch=cfg["nb_epoch"])
+
+
+if __name__ == "__main__":
+    train()
+```
